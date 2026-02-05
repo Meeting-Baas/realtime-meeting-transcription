@@ -129,8 +129,8 @@ class MeetingBaasClient {
     if (this.botId) {
       logger.info(`Requesting bot ${this.botId} to leave meeting...`);
       try {
-        // SDK v6 v2 API uses deleteBot
-        const result = await this.client.deleteBot({
+        // SDK v6 v2 API uses leaveBot
+        const result = await this.client.leaveBot({
           bot_id: this.botId,
         });
 
