@@ -1,4 +1,4 @@
-import { createBaasClient, type BaasClientV1Methods } from "@meeting-baas/sdk";
+import { createBaasClient, type BaasClientV2Methods } from "@meeting-baas/sdk";
 import { apiKeys, apiUrls } from "./config";
 import { createLogger } from "./utils";
 import { getProcessLogger } from "./processLogger";
@@ -7,14 +7,14 @@ const logger = createLogger("MeetingBaas");
 const processLogger = getProcessLogger();
 
 class MeetingBaasClient {
-  private client: BaasClientV1Methods;
+  private client: BaasClientV2Methods;
   private botId: string | null = null;
 
   constructor() {
     this.client = createBaasClient({
       api_key: apiKeys.meetingBaas,
       base_url: apiUrls.meetingBaas,
-      api_version: "v1",
+      api_version: "v2",
     });
 
     logger.info(`Initialized MeetingBaas SDK client with base URL: ${apiUrls.meetingBaas}`);
@@ -93,12 +93,12 @@ class MeetingBaasClient {
 
       // Join the meeting using the SDK
       processLogger?.info(
-        `Calling MeetingBaas API joinMeeting`,
+        `Calling MeetingBaas API createBot (v2)`,
         "MeetingBaas",
         { config: joinConfig }
       );
 
-      const result = await this.client.joinMeeting(joinConfig);
+      const result = await this.client.createBot(joinConfig);
 
       if (result.success) {
         this.botId = result.data.bot_id;
@@ -129,9 +129,9 @@ class MeetingBaasClient {
     if (this.botId) {
       logger.info(`Requesting bot ${this.botId} to leave meeting...`);
       try {
-        // SDK v6 uses bot_id parameter
-        const result = await this.client.leaveMeeting({
-          uuid: this.botId,
+        // SDK v6 v2 API uses deleteBot
+        const result = await this.client.deleteBot({
+          bot_id: this.botId,
         });
 
         if (result.success) {
