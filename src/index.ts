@@ -125,6 +125,7 @@ function displayDataStorageSummary(
   console.log("⚙️  Configuration:");
   console.log(`   • Transcript Logging: ${proxyConfig.transcriptLogging.enabled ? "ENABLED" : "DISABLED"}`);
   console.log(`   • Audio Recording: ${proxyConfig.recording.enabled ? "ENABLED" : "DISABLED"}`);
+  console.log(`   • Transcription: ${proxyConfig.transcription.enabled ? "ENABLED" : "DISABLED"}`);
   console.log(`   • Audio Playback: ${proxyConfig.playback.enabled ? "ENABLED" : "DISABLED"}`);
   console.log("");
 

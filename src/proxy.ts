@@ -104,8 +104,9 @@ class TranscriptionProxy {
   private server: WebSocket.Server;
   private botClient: WebSocket | null = null;
   private meetingBaasClients: Set<WebSocket> = new Set();
-  private gladiaClient: GladiaClient;
+  private gladiaClient: GladiaClient | null = null;
   private isGladiaSessionActive: boolean = false;
+  private transcriptionEnabled: boolean;
   private lastSpeaker: string | null = null;
   private audioBuffers: Buffer[] = [];
   private recordingStartTime: number | null = null;
@@ -121,6 +122,24 @@ class TranscriptionProxy {
   private waitingForRecordingStatus: boolean = true;
   private transcriptionInitialized: boolean = false;
   private mode: string;
+
+  // Latency tracking
+  private connectionTime: number | null = null;
+  private firstAudioTime: number | null = null;
+  private lastChunkTime: number | null = null;
+  private chunkCount: number = 0;
+  private totalBytes: number = 0;
+  private interChunkDelays: number[] = [];
+  private latencyLogInterval: NodeJS.Timeout | null = null;
+
+  // Audio quality tracking
+  private clippedSamples: number = 0;
+  private totalSamples: number = 0;
+  private peakAmplitude: number = 0;
+  private silentChunks: number = 0;
+  private gapCount: number = 0; // chunks arriving >100ms late (causes crackling)
+  private speakerBackpressureCount: number = 0;
+  private chunkSizes: number[] = [];
 
   constructor(mode: string = "Proxy") {
     this.mode = mode;
@@ -157,7 +176,13 @@ class TranscriptionProxy {
       logger.info(`Webhook endpoint: http://${proxyConfig.host}:${proxyConfig.port}/webhooks/meetingbaas`);
     });
 
-    this.gladiaClient = new GladiaClient();
+    this.transcriptionEnabled = proxyConfig.transcription.enabled;
+
+    if (this.transcriptionEnabled) {
+      this.gladiaClient = new GladiaClient();
+    } else {
+      logger.info("Transcription DISABLED - running in echo/playback only mode");
+    }
 
     // Use the TUI singleton (initialized in index.ts) and update its config
     const tui = getTUI();
@@ -175,26 +200,28 @@ class TranscriptionProxy {
     }
 
     // Set up transcription callback
-    this.gladiaClient.onTranscription((text, isFinal) => {
-      // Show transcription in visualizer
-      this.audioVisualizer.showTranscription(text, isFinal);
+    if (this.gladiaClient) {
+      this.gladiaClient.onTranscription((text, isFinal) => {
+        // Show transcription in visualizer
+        this.audioVisualizer.showTranscription(text, isFinal);
 
-      // Create a transcription message to send to the bot client
-      const transcriptionMsg = {
-        type: "transcription",
-        data: {
-          text: text,
-          isFinal: isFinal,
-          startTime: Date.now(), // Approximate
-          endTime: Date.now(), // Approximate
-        },
-      };
+        // Create a transcription message to send to the bot client
+        const transcriptionMsg = {
+          type: "transcription",
+          data: {
+            text: text,
+            isFinal: isFinal,
+            startTime: Date.now(), // Approximate
+            endTime: Date.now(), // Approximate
+          },
+        };
 
-      // Send the transcription to the bot client
-      if (this.botClient && this.botClient.readyState === WebSocket.OPEN) {
-        this.botClient.send(JSON.stringify(transcriptionMsg));
-      }
-    });
+        // Send the transcription to the bot client
+        if (this.botClient && this.botClient.readyState === WebSocket.OPEN) {
+          this.botClient.send(JSON.stringify(transcriptionMsg));
+        }
+      });
+    }
 
     this.server.on("connection", (ws) => {
       logger.info("New connection established");
@@ -217,6 +244,95 @@ class TranscriptionProxy {
   }
 
   /**
+   * Get latency and streaming statistics
+   */
+  private getLatencyStats() {
+    const now = Date.now();
+    const elapsed = this.connectionTime ? (now - this.connectionTime) / 1000 : 0;
+    const delays = this.interChunkDelays;
+    const avgDelay = delays.length > 0 ? delays.reduce((a, b) => a + b, 0) / delays.length : 0;
+    const minDelay = delays.length > 0 ? Math.min(...delays) : 0;
+    const maxDelay = delays.length > 0 ? Math.max(...delays) : 0;
+    // Jitter = standard deviation of inter-chunk delays
+    const variance = delays.length > 0
+      ? delays.reduce((sum, d) => sum + Math.pow(d - avgDelay, 2), 0) / delays.length
+      : 0;
+    const jitter = Math.sqrt(variance);
+
+    return {
+      connected: !!this.connectionTime,
+      elapsedSeconds: Math.round(elapsed),
+      timeToFirstAudioMs: this.firstAudioTime && this.connectionTime
+        ? this.firstAudioTime - this.connectionTime : null,
+      chunkCount: this.chunkCount,
+      totalBytes: this.totalBytes,
+      totalMB: (this.totalBytes / 1024 / 1024).toFixed(2),
+      dataRateKbps: elapsed > 0 ? (this.totalBytes * 8) / 1000 / elapsed : 0,
+      avgInterChunkMs: avgDelay,
+      minInterChunkMs: minDelay,
+      maxInterChunkMs: maxDelay,
+      jitterMs: jitter,
+      // Expected chunk interval for 16kHz mono 16-bit = 32000 bytes/sec
+      expectedChunkIntervalMs: this.chunkCount > 0
+        ? (this.totalBytes / this.chunkCount) / 32 // 32 bytes per ms at 16kHz 16-bit mono
+        : 0,
+      // Audio quality
+      audio: {
+        peakAmplitude: this.peakAmplitude,
+        peakDb: this.peakAmplitude > 0 ? (20 * Math.log10(this.peakAmplitude / 32767)).toFixed(1) : "-inf",
+        clippedSamples: this.clippedSamples,
+        clippingPercent: this.totalSamples > 0 ? ((this.clippedSamples / this.totalSamples) * 100).toFixed(4) : "0",
+        totalSamples: this.totalSamples,
+        silentChunks: this.silentChunks,
+        silentPercent: this.chunkCount > 0 ? ((this.silentChunks / this.chunkCount) * 100).toFixed(1) : "0",
+        gapCount: this.gapCount, // gaps >100ms = crackling source
+        speakerBackpressure: this.speakerBackpressureCount,
+        avgChunkSize: this.chunkSizes.length > 0 ? Math.round(this.chunkSizes.reduce((a, b) => a + b, 0) / this.chunkSizes.length) : 0,
+        minChunkSize: this.chunkSizes.length > 0 ? Math.min(...this.chunkSizes) : 0,
+        maxChunkSize: this.chunkSizes.length > 0 ? Math.max(...this.chunkSizes) : 0,
+      },
+      // Diagnostic: likely cause of crackling
+      diagnosis: this.getDiagnosis(),
+    };
+  }
+
+  /**
+   * Diagnose likely cause of audio crackling
+   */
+  private getDiagnosis(): string[] {
+    const issues: string[] = [];
+    if (this.gapCount > 0) {
+      issues.push(`${this.gapCount} network gaps >100ms detected - main crackling source (network jitter via ngrok)`);
+    }
+    if (this.speakerBackpressureCount > 0) {
+      issues.push(`${this.speakerBackpressureCount}x speaker backpressure - audio arriving faster than playback`);
+    }
+    if (this.clippedSamples > 0) {
+      const pct = ((this.clippedSamples / this.totalSamples) * 100).toFixed(2);
+      issues.push(`${pct}% samples clipped (amplitude at max 32767) - digital distortion`);
+    }
+    const delays = this.interChunkDelays;
+    if (delays.length > 10) {
+      const avgDelay = delays.reduce((a, b) => a + b, 0) / delays.length;
+      const variance = delays.reduce((sum, d) => sum + Math.pow(d - avgDelay, 2), 0) / delays.length;
+      const jitter = Math.sqrt(variance);
+      if (jitter > 20) {
+        issues.push(`High jitter: ${jitter.toFixed(1)}ms - inconsistent chunk delivery`);
+      }
+    }
+    if (this.chunkSizes.length > 1) {
+      const sizes = new Set(this.chunkSizes);
+      if (sizes.size > 5) {
+        issues.push(`Inconsistent chunk sizes (${sizes.size} different sizes) - may cause playback glitches`);
+      }
+    }
+    if (issues.length === 0) {
+      issues.push("No obvious issues detected");
+    }
+    return issues;
+  }
+
+  /**
    * Setup webhook routes for MeetingBaas events
    */
   private setupWebhookRoutes(): void {
@@ -227,6 +343,11 @@ class TranscriptionProxy {
         service: "transcription-proxy",
         timestamp: new Date().toISOString(),
       });
+    });
+
+    // Latency stats endpoint
+    this.app.get("/stats", (req: Request, res: Response) => {
+      res.status(200).json(this.getLatencyStats());
     });
 
     // MeetingBaas webhook endpoint
@@ -427,7 +548,6 @@ class TranscriptionProxy {
         channels: proxyConfig.audioParams.channels,
         bitDepth: 16,
         sampleRate: proxyConfig.audioParams.sampleRate,
-        // Minimize internal buffering for lowest latency
         highWaterMark: 0,
         lowWaterMark: 0,
       });
@@ -461,16 +581,43 @@ class TranscriptionProxy {
   }
 
   /**
-   * Play audio directly to speaker (no buffering)
+   * Analyze a 16-bit PCM audio chunk for quality issues
+   */
+  private analyzeAudioChunk(audioBuffer: Buffer): void {
+    let chunkPeak = 0;
+    let chunkRms = 0;
+    let clipped = 0;
+    const numSamples = Math.floor(audioBuffer.length / 2); // 16-bit = 2 bytes per sample
+
+    for (let i = 0; i < audioBuffer.length - 1; i += 2) {
+      const sample = audioBuffer.readInt16LE(i);
+      const abs = Math.abs(sample);
+      chunkRms += sample * sample;
+      if (abs > chunkPeak) chunkPeak = abs;
+      if (abs >= 32767) clipped++; // Max value for 16-bit = clipping
+    }
+
+    this.totalSamples += numSamples;
+    this.clippedSamples += clipped;
+    if (chunkPeak > this.peakAmplitude) this.peakAmplitude = chunkPeak;
+
+    // Detect silent chunks (RMS < -60dB)
+    const rms = numSamples > 0 ? Math.sqrt(chunkRms / numSamples) : 0;
+    if (rms < 100) this.silentChunks++; // ~-50dB threshold
+  }
+
+  /**
+   * Play audio directly to speaker
    */
   private playAudio(audioBuffer: Buffer): void {
     if (!proxyConfig.playback.enabled || !this.speaker || !this.isPlaybackReady) {
       return;
     }
 
-    // Write directly to speaker - no buffering, no backpressure handling
-    // If it can't keep up, audio will be choppy but no latency
-    this.speaker.write(audioBuffer);
+    const canWrite = this.speaker.write(audioBuffer);
+    if (!canWrite) {
+      this.speakerBackpressureCount++;
+    }
   }
 
   private setupBotClient(ws: WebSocket) {
@@ -502,7 +649,16 @@ class TranscriptionProxy {
 
   private setupMeetingBaasClient(ws: WebSocket) {
     logger.info("MeetingBaas client connected");
+    this.connectionTime = Date.now();
     this.meetingBaasClients.add(ws);
+
+    // Start periodic latency logging
+    this.latencyLogInterval = setInterval(() => {
+      if (this.chunkCount > 0) {
+        const stats = this.getLatencyStats();
+        logger.info(`📊 Streaming stats: ${stats.chunkCount} chunks, ${stats.dataRateKbps.toFixed(1)} kbps, avg gap: ${stats.avgInterChunkMs.toFixed(1)}ms, jitter: ${stats.jitterMs.toFixed(1)}ms`);
+      }
+    }, 10000);
 
     // Don't initialize transcription immediately - wait for in_call_not_recording status via webhook
     if (this.waitingForRecordingStatus) {
@@ -562,6 +718,29 @@ class TranscriptionProxy {
         } catch {
           // Likely audio data, send to transcription provider
           const audioBuffer = Buffer.isBuffer(message) ? message : Buffer.from(message);
+          const now = Date.now();
+
+          // Latency tracking
+          if (!this.firstAudioTime) {
+            this.firstAudioTime = now;
+            const timeToFirstAudio = this.connectionTime ? now - this.connectionTime : 0;
+            logger.info(`🎯 First audio chunk received! Time since connection: ${timeToFirstAudio}ms, chunk size: ${audioBuffer.length} bytes`);
+          }
+          if (this.lastChunkTime) {
+            const gap = now - this.lastChunkTime;
+            this.interChunkDelays.push(gap);
+            if (gap > 100) {
+              this.gapCount++;
+              logger.warn(`⚠️ Audio gap detected: ${gap}ms between chunks (causes crackling)`);
+            }
+          }
+          this.lastChunkTime = now;
+          this.chunkCount++;
+          this.totalBytes += audioBuffer.length;
+          this.chunkSizes.push(audioBuffer.length);
+
+          // Audio quality analysis (16-bit PCM signed LE)
+          this.analyzeAudioChunk(audioBuffer);
 
           getProcessLogger()?.debug(
             `Received audio chunk from MeetingBaas`,
@@ -569,15 +748,17 @@ class TranscriptionProxy {
             { size: audioBuffer.length, isGladiaActive: this.isGladiaSessionActive }
           );
 
-          if (this.isGladiaSessionActive) {
-            getProcessLogger()?.debug(`Sending audio chunk to Gladia`, "Proxy", { size: audioBuffer.length });
-            this.gladiaClient.sendAudioChunk(audioBuffer).catch((error) => {
-              logger.error("❌ Error sending audio chunk to transcription:", error);
-              getProcessLogger()?.error(`Failed to send audio chunk to Gladia`, "Proxy", { error: error.message });
-            });
-          } else {
-            logger.warn(`⚠️ Transcription session not active yet, dropping audio chunk`);
-            getProcessLogger()?.warn(`Gladia session not active, dropping audio chunk`, "Proxy");
+          if (this.transcriptionEnabled) {
+            if (this.isGladiaSessionActive && this.gladiaClient) {
+              getProcessLogger()?.debug(`Sending audio chunk to Gladia`, "Proxy", { size: audioBuffer.length });
+              this.gladiaClient.sendAudioChunk(audioBuffer).catch((error) => {
+                logger.error("❌ Error sending audio chunk to transcription:", error);
+                getProcessLogger()?.error(`Failed to send audio chunk to Gladia`, "Proxy", { error: error.message });
+              });
+            } else {
+              logger.warn(`⚠️ Transcription session not active yet, dropping audio chunk`);
+              getProcessLogger()?.warn(`Gladia session not active, dropping audio chunk`, "Proxy");
+            }
           }
 
           // Update audio visualizer (no buffering, so buffer pressure always 0)
@@ -613,7 +794,7 @@ class TranscriptionProxy {
 
         await this.saveAudioToFile();
 
-        if (this.isGladiaSessionActive) {
+        if (this.isGladiaSessionActive && this.gladiaClient) {
           this.gladiaClient.endSession();
           this.isGladiaSessionActive = false;
         }
@@ -639,6 +820,12 @@ class TranscriptionProxy {
    * Called either immediately (local mode) or when bot.status_change indicates in_call_not_recording
    */
   private initializeTranscriptionSession(): void {
+    if (!this.transcriptionEnabled || !this.gladiaClient) {
+      logger.info("Transcription disabled - skipping session initialization");
+      this.audioVisualizer.addLog("Echo mode - no transcription", "info");
+      return;
+    }
+
     if (this.transcriptionInitialized || this.isGladiaSessionActive) {
       logger.info("Transcription session already initialized, skipping");
       return;
@@ -648,14 +835,14 @@ class TranscriptionProxy {
     logger.info("🔄 Initializing transcription session...");
     this.audioVisualizer.addLog("Starting transcription...", "info");
 
-    this.gladiaClient.initSession().then((success) => {
+    this.gladiaClient!.initSession().then((success) => {
       this.isGladiaSessionActive = success;
       if (success) {
         logger.info("✅ Transcription session ready and active!");
         this.audioVisualizer.addLog("Transcription active!", "info");
       } else {
         // Get error message and truncate to 128 chars
-        const rawError = this.gladiaClient.getLastError();
+        const rawError = this.gladiaClient!.getLastError();
         const errorMsg = rawError ? rawError.substring(0, 128) : "Unknown error";
         const displayMsg = `Failed with message: ${errorMsg}`;
 
@@ -816,6 +1003,13 @@ class TranscriptionProxy {
   }
 
   public async shutdown(): Promise<void> {
+    // Log final stats
+    if (this.chunkCount > 0) {
+      const stats = this.getLatencyStats();
+      logger.info(`📊 Final stats: ${stats.chunkCount} chunks, ${stats.totalMB} MB, avg gap: ${stats.avgInterChunkMs.toFixed(1)}ms, jitter: ${stats.jitterMs.toFixed(1)}ms`);
+    }
+    if (this.latencyLogInterval) clearInterval(this.latencyLogInterval);
+
     // Note: TUI cleanup is handled by index.ts (cleanupTUI) since it's a singleton
 
     // Stop audio playback
@@ -834,7 +1028,7 @@ class TranscriptionProxy {
     await this.saveAudioToFile();
 
     // End the Gladia session if it's active
-    if (this.isGladiaSessionActive) {
+    if (this.isGladiaSessionActive && this.gladiaClient) {
       logger.info("Ending Gladia transcription session...");
       await this.gladiaClient.endSession();
       this.isGladiaSessionActive = false;
@@ -864,7 +1058,7 @@ class TranscriptionProxy {
    * Get information about the last transcript session
    */
   public getLastTranscriptInfo(): { sessionDir: string; transcriptCount: number; duration: number } | null {
-    return this.gladiaClient.getLastTranscriptInfo();
+    return this.gladiaClient?.getLastTranscriptInfo() ?? null;
   }
 
   /**

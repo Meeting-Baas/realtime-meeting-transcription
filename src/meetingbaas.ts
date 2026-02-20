@@ -71,16 +71,17 @@ class MeetingBaasClient {
         );
       }
 
-      // Prepare join meeting configuration
+      // Prepare join meeting configuration (v2 API format)
       const joinConfig: any = {
         bot_name: botName,
         meeting_url: meetingUrl,
         reserved: false,
-        deduplication_key: deduplicationKey, // Use unique deduplication key
-        // Configure streaming to WebSocket
-        streaming: {
-          output: wsUrl, // WebSocket URL for streaming audio output
-          audio_frequency: "16khz", // Audio frequency for streaming (matches Gladia requirements)
+        deduplication_key: deduplicationKey,
+        // v2 streaming config
+        streaming_enabled: true,
+        streaming_config: {
+          output_url: wsUrl,
+          audio_frequency: 16000,
         },
       };
 

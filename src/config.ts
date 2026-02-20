@@ -20,7 +20,7 @@ export const proxyConfig = {
   port: parseInt(process.env.PROXY_PORT || "4040"),
   botUrl: process.env.BOT_URL || "ws://localhost:8766",
   audioParams: {
-    sampleRate: 16000, // Match bot's streaming_audio_frequency and Gladia requirements
+    sampleRate: 16000,
     channels: 1,
   },
   audioConfig: {
@@ -35,6 +35,9 @@ export const proxyConfig = {
   },
   playback: {
     enabled: process.env.ENABLE_AUDIO_PLAYBACK === "true",
+  },
+  transcription: {
+    enabled: process.env.ENABLE_TRANSCRIPTION !== "false", // Enabled by default
   },
   transcriptLogging: {
     enabled: process.env.ENABLE_TRANSCRIPT_LOGGING !== "false", // Enabled by default
@@ -138,11 +141,13 @@ if (!apiKeys.meetingBaas) {
   process.exit(1);
 }
 
-// Check if at least one transcription provider is configured
-const hasProvider = Object.keys(voiceRouterConfig.providers).length > 0;
-if (!hasProvider) {
-  console.error(
-    "At least one transcription provider API key is required (GLADIA_API_KEY, DEEPGRAM_API_KEY, ASSEMBLYAI_API_KEY, etc.)"
-  );
-  process.exit(1);
+// Check if at least one transcription provider is configured (skip if transcription is disabled)
+if (proxyConfig.transcription.enabled) {
+  const hasProvider = Object.keys(voiceRouterConfig.providers).length > 0;
+  if (!hasProvider) {
+    console.error(
+      "At least one transcription provider API key is required (GLADIA_API_KEY, DEEPGRAM_API_KEY, ASSEMBLYAI_API_KEY, etc.)"
+    );
+    process.exit(1);
+  }
 }
