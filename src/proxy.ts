@@ -527,35 +527,42 @@ class TranscriptionProxy {
           const jsonStr = message.toString("utf8");
           const jsonData = JSON.parse(jsonStr);
 
-          // If it's speaker information
+          // V2 bot handshake: { protocol_version, bot_id, offset, sample_rate }
           if (
+            jsonData &&
+            typeof jsonData === "object" &&
+            !Array.isArray(jsonData) &&
+            "protocol_version" in jsonData
+          ) {
+            logger.info(
+              `Bot handshake received: protocol_version=${jsonData.protocol_version}, ` +
+              `bot_id=${jsonData.bot_id}, sample_rate=${jsonData.sample_rate}`
+            );
+
+          // Speaker information: [{ name, id, timestamp, isSpeaking }, ...]
+          // The array contains ALL participants; find whoever is currently speaking
+          } else if (
             Array.isArray(jsonData) &&
             jsonData.length > 0 &&
             "name" in jsonData[0] &&
             "isSpeaking" in jsonData[0]
           ) {
-            const speakerInfo = jsonData[0] as SpeakerInfo;
+            const speakers = jsonData as SpeakerInfo[];
+            const activeSpeaker = speakers.find((s) => s.isSpeaking);
 
-            // Only log when a new speaker starts talking (different from the last one)
-            // or when we haven't seen any speaker yet
             if (
-              speakerInfo.isSpeaking &&
+              activeSpeaker &&
               (this.lastSpeaker === null ||
-                this.lastSpeaker !== speakerInfo.name)
+                this.lastSpeaker !== activeSpeaker.name)
             ) {
-              // Update our last speaker tracking
-              this.lastSpeaker = speakerInfo.name;
-
-              // Update visualizer with new speaker
-              this.audioVisualizer.updateSpeaker(speakerInfo.name);
-
-              // Log the new speaker
+              this.lastSpeaker = activeSpeaker.name;
+              this.audioVisualizer.updateSpeaker(activeSpeaker.name);
               logger.info(
-                `New speaker: ${speakerInfo.name} (id: ${speakerInfo.id})`
+                `New speaker: ${activeSpeaker.name} (id: ${activeSpeaker.id})`
               );
             }
 
-            // For other JSON messages, log as usual without speaker tracking
+          // Unknown JSON message
           } else {
             logger.info(`Message from MeetingBaas: ${inspectMessage(message)}`);
           }

@@ -21,16 +21,7 @@ class MeetingBaasClient {
   }
 
   /**
-   * Generate a unique deduplication key
-   */
-  private generateDeduplicationKey(botName: string): string {
-    const timestamp = Date.now();
-    const random = Math.random().toString(36).substring(2, 8);
-    return `${botName}-${timestamp}-${random}`;
-  }
-
-  /**
-   * Connect to a meeting via MeetingBaas
+   * Connect to a meeting via MeetingBaas v2 API
    * @param meetingUrl URL of the meeting to join
    * @param botName Name of the bot
    * @param streamingUrl WebSocket URL where MeetingBaas will stream audio (wss://)
@@ -51,10 +42,6 @@ class MeetingBaasClient {
         { meetingUrl, botName, streamingUrl }
       );
 
-      // Generate a unique deduplication key
-      const deduplicationKey = this.generateDeduplicationKey(botName);
-      logger.info(`Using deduplication key: ${deduplicationKey}`);
-
       // Convert HTTP/HTTPS URL to WebSocket URL if needed
       let wsUrl = streamingUrl;
       if (streamingUrl) {
@@ -71,34 +58,42 @@ class MeetingBaasClient {
         );
       }
 
-      // Prepare join meeting configuration
-      const joinConfig: any = {
-        bot_name: botName,
-        meeting_url: meetingUrl,
-        reserved: false,
-        deduplication_key: deduplicationKey, // Use unique deduplication key
-        // Configure streaming to WebSocket
-        streaming: {
-          output: wsUrl, // WebSocket URL for streaming audio output
-          audio_frequency: "16khz", // Audio frequency for streaming (matches Gladia requirements)
-        },
-      };
-
-      // Add webhook URL - prioritize CLI argument over environment variable
+      // Add callback URL - prioritize CLI argument over environment variable
       const finalWebhookUrl = webhookUrl || apiUrls.meetingBaasWebhook;
       if (finalWebhookUrl) {
-        joinConfig.webhook_url = finalWebhookUrl;
-        logger.info(`Using webhook URL for notifications: ${finalWebhookUrl}`);
+        logger.info(`Using callback URL for notifications: ${finalWebhookUrl}`);
       }
+
+      // Prepare v2 API request body
+      type CreateBotParams = Parameters<BaasClientV2Methods["createBot"]>[0];
+      const requestBody: CreateBotParams = {
+        bot_name: botName,
+        meeting_url: meetingUrl,
+        ...(wsUrl && {
+          streaming_enabled: true,
+          streaming_config: {
+            output_url: wsUrl,
+            audio_frequency: 16000 as const,
+          },
+        }),
+        ...(finalWebhookUrl && {
+          callback_enabled: true,
+          callback_config: {
+            url: finalWebhookUrl,
+          },
+        }),
+      };
 
       // Join the meeting using the SDK
       processLogger?.info(
         `Calling MeetingBaas API createBot (v2)`,
         "MeetingBaas",
-        { config: joinConfig }
+        { config: requestBody }
       );
 
-      const result = await this.client.createBot(joinConfig);
+      logger.info(`Request body: ${JSON.stringify(requestBody, null, 2)}`);
+
+      const result = await this.client.createBot(requestBody);
 
       if (result.success) {
         this.botId = result.data.bot_id;
@@ -111,7 +106,7 @@ class MeetingBaasClient {
         );
         return true;
       } else {
-        logger.error("Failed to join meeting:", result.error);
+        logger.error("Failed to create bot:", JSON.stringify(result, null, 2));
         processLogger?.error(
           `MeetingBaas API error`,
           "MeetingBaas",
@@ -119,8 +114,11 @@ class MeetingBaasClient {
         );
         return false;
       }
-    } catch (error) {
-      logger.error("Error connecting to meeting:", error);
+    } catch (error: any) {
+      logger.error("Error connecting to meeting:", error?.message || error);
+      if (error?.response?.data) {
+        logger.error("API Error data:", JSON.stringify(error.response.data, null, 2));
+      }
       return false;
     }
   }
